@@ -1,0 +1,177 @@
+name: Deploy Windows 11 RDP with GPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_size:
+        description: 'Azure VM Size (GPU enabled)'
+        required: true
+        default: 'Standard_NV6'
+        type: choice
+        options:
+        - Standard_NV6
+        - Standard_NV12s_v3
+        - Standard_NV24s_v3
+        - Standard_NC6s_v3
+      run_duration:
+        description: 'Maximum run duration (hours)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+        - '2'
+        - '4'
+        - '6'
+        - '8'
+
+env:
+  RESOURCE_GROUP: 'win11-rdp-gpu'
+  VM_NAME: 'win11-gpu-rdp'
+  LOCATION: 'eastus'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create Resource Group
+      run: |
+        az group create --name $RESOURCE_GROUP --location $LOCATION
+
+    - name: Create GPU-enabled VM
+      run: |
+        az vm create \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --image MicrosoftWindowsDesktop:Windows-11:win11-23h2-pro-g2:latest \
+          --size ${{ github.event.inputs.vm_size }} \
+          --admin-username rdpuser \
+          --admin-password ${{ secrets.VM_ADMIN_PASSWORD }} \
+          --public-ip-address "" \
+          --nsg "" \
+          --data-disk-sizes-gb 128 \
+          --os-disk-size-gb 256
+
+    - name: Install NVIDIA Drivers
+      run: |
+        az vm extension set \
+          --resource-group $RESOURCE_GROUP \
+          --vm-name $VM_NAME \
+          --name NvidiaGpuDriverWindows \
+          --publisher Microsoft.HpcCompute
+
+    - name: Install and Configure Tailscale
+      run: |
+        az vm run-command invoke \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --command-id RunPowerShellScript \
+          --scripts @scripts/install-tailscale.ps1 \
+          --parameters "authKey=${{ secrets.TAILSCALE_AUTH_KEY }}"
+
+    - name: Configure RDP and GPU
+      run: |
+        az vm run-command invoke \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --command-id RunPowerShellScript \
+          --scripts @scripts/configure-rdp-gpu.ps1
+
+    - name: Get Tailscale IP
+      id: tailscale_ip
+      run: |
+        IP=$(az vm run-command invoke \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --command-id RunPowerShellScript \
+          --scripts "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -like '100.*' } | Select-Object -ExpandProperty IPAddress" \
+          --query "value[0].message" -o tsv)
+        echo "ip=$IP" >> $GITHUB_OUTPUT
+
+    - name: Generate RDP File
+      run: |
+        cat > windows11-gpu.rdp << EOF
+screen mode id:i:2
+use multimon:i:1
+desktopwidth:i:1920
+desktopheight:i:1080
+session bpp:i:32
+winposstr:s:0,1,0,0,800,600
+compression:i:1
+keyboardhook:i:2
+audiocapturemode:i:0
+videoplaybackmode:i:1
+connection type:i:7
+networkautodetect:i:1
+bandwidthautodetect:i:1
+displayconnectionbar:i:1
+enableworkspacereconnect:i:0
+disable wallpaper:i:0
+allow font smoothing:i:1
+allow desktop composition:i:1
+disable full window drag:i:1
+disable menu anims:i:1
+disable themes:i:0
+disable cursor setting:i:0
+bitmapcachepersistenable:i:1
+full address:s:${{ steps.tailscale_ip.outputs.ip }}
+audiomode:i:0
+redirectprinters:i:1
+redirectcomports:i:0
+redirectsmartcards:i:1
+redirectclipboard:i:1
+redirectposdevices:i:0
+autoreconnection enabled:i:1
+authentication level:i:2
+prompt for credentials:i:0
+negotiate security layer:i:1
+remoteapplicationmode:i:0
+alternate shell:s:
+shell working directory:s:
+gatewayhostname:s:
+gatewayusagemethod:i:4
+gatewaycredentialssource:i:4
+gatewayprofileusagemethod:i:0
+promptcredentialonce:i:0
+use redirection server name:i:0
+rdgiskdcproxy:i:0
+kdcproxyname:s:
+drivestoredirect:s:
+encode video: i:1
+video compression quality: i:100
+gpu acceleration: i:1
+avc444 mode: i:1
+avc444 mode preferred: i:1
+EOF
+
+    - name: Upload RDP File
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows11-gpu-rdp
+        path: windows11-gpu.rdp
+
+    - name: Output Connection Info
+      run: |
+        echo "Windows 11 RDP with GPU is ready!"
+        echo "Tailscale IP: ${{ steps.tailscale_ip.outputs.ip }}"
+        echo "Username: rdpuser"
+        echo "Download the RDP file from the Artifacts section"
+
+  auto-shutdown:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+    - name: Configure Auto Shutdown
+      run: |
+        az vm auto-shutdown \
+          --resource-group $RESOURCE_GROUP \
+          --name $VM_NAME \
+          --time 0230 \
+          --email "your-email@example.com"
