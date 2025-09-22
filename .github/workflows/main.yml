@@ -1,103 +1,157 @@
-name: Deploy Windows 11 RDP with GPU
+name: RDP with GPU
 
 on:
   workflow_dispatch:
-    inputs:
-      vm_size:
-        description: 'Azure VM Size (GPU enabled)'
-        required: true
-        default: 'Standard_NV6'
-        type: choice
-        options:
-        - Standard_NV6
-        - Standard_NV12s_v3
-        - Standard_NV24s_v3
-        - Standard_NC6s_v3
-      run_duration:
-        description: 'Maximum run duration (hours)'
-        required: true
-        default: '6'
-        type: choice
-        options:
-        - '2'
-        - '4'
-        - '6'
-        - '8'
-
-env:
-  RESOURCE_GROUP: 'win11-rdp-gpu'
-  VM_NAME: 'win11-gpu-rdp'
-  LOCATION: 'eastus'
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Check GPU Hardware
+        run: |
+          Write-Host "=== Checking GPU Hardware ==="
+          Get-CimInstance -ClassName Win32_VideoController | Format-Table Name, AdapterRAM, DriverVersion, Status -AutoSize
+          
+          # Check for NVIDIA GPU specifically
+          $nvidiaGPU = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -like "*NVIDIA*" }
+          if ($nvidiaGPU) {
+              Write-Host "✅ NVIDIA GPU detected: $($nvidiaGPU.Name)"
+              echo "HAS_NVIDIA_GPU=true" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "⚠️ No NVIDIA GPU detected - GPU acceleration may be limited"
+              echo "HAS_NVIDIA_GPU=false" >> $env:GITHUB_ENV
+          }
 
-    - name: Azure Login
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Install NVIDIA GPU Drivers and Tools
+        if: env.HAS_NVIDIA_GPU == 'true'
+        run: |
+          Write-Host "Installing NVIDIA GPU drivers and tools..."
+          
+          # Install Chocolatey if not present
+          if (!(Get-Command choco -ErrorAction SilentlyContinue)) {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          }
+          
+          # Install NVIDIA display driver and CUDA tools
+          choco install -y nvidia-display-driver --ignore-checksums
+          choco install -y cuda --version=12.3.0 --ignore-checksums
+          choco install -y nvidia-container-toolkit --ignore-checksums
 
-    - name: Create Resource Group
-      run: |
-        az group create --name $RESOURCE_GROUP --location $LOCATION
+      - name: Configure Core RDP Settings with GPU Optimization
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-    - name: Create GPU-enabled VM
-      run: |
-        az vm create \
-          --resource-group $RESOURCE_GROUP \
-          --name $VM_NAME \
-          --image MicrosoftWindowsDesktop:Windows-11:win11-23h2-pro-g2:latest \
-          --size ${{ github.event.inputs.vm_size }} \
-          --admin-username rdpuser \
-          --admin-password ${{ secrets.VM_ADMIN_PASSWORD }} \
-          --public-ip-address "" \
-          --nsg "" \
-          --data-disk-sizes-gb 128 \
-          --os-disk-size-gb 256
+          # Enable RDP GPU Acceleration
+          Write-Host "Configuring RDP for GPU acceleration..."
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "bEnumerateHWBeforeSW" -Value 1 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AVCHardwareEncodePreferred" -Value 1 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "AVC444ModePreferred" -Value 1 -ErrorAction SilentlyContinue
+          
+          # Configure H.264/AVC hardware encoding
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fEnableHardwareMode" -Value 1 -ErrorAction SilentlyContinue
+          
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-    - name: Install NVIDIA Drivers
-      run: |
-        az vm extension set \
-          --resource-group $RESOURCE_GROUP \
-          --vm-name $VM_NAME \
-          --name NvidiaGpuDriverWindows \
-          --publisher Microsoft.HpcCompute
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-    - name: Install and Configure Tailscale
-      run: |
-        az vm run-command invoke \
-          --resource-group $RESOURCE_GROUP \
-          --name $VM_NAME \
-          --command-id RunPowerShellScript \
-          --scripts @scripts/install-tailscale.ps1 \
-          --parameters "authKey=${{ secrets.TAILSCALE_AUTH_KEY }}"
+      - name: Optimize System for GPU Performance
+        run: |
+          Write-Host "Optimizing system for GPU performance..."
+          
+          # Set power plan to high performance
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          
+          # Disable GPU timeout and enable maximum performance
+          if (env:HAS_NVIDIA_GPU -eq 'true') {
+              # Install NVIDIA profile inspector or use nvidia-smi if available
+              $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+              if ($nvidiaSmi) {
+                  # Set GPU to maximum performance mode
+                  & nvidia-smi -pm 1  # Persistence mode
+                  & nvidia-smi -pl 250  # Power limit (adjust based on GPU)
+                  Write-Host "NVIDIA GPU performance optimized"
+              }
+          }
+          
+          # Optimize Windows for background services
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 26 -ErrorAction SilentlyContinue
 
-    - name: Configure RDP and GPU
-      run: |
-        az vm run-command invoke \
-          --resource-group $RESOURCE_GROUP \
-          --name $VM_NAME \
-          --command-id RunPowerShellScript \
-          --scripts @scripts/configure-rdp-gpu.ps1
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-    - name: Get Tailscale IP
-      id: tailscale_ip
-      run: |
-        IP=$(az vm run-command invoke \
-          --resource-group $RESOURCE_GROUP \
-          --name $VM_NAME \
-          --command-id RunPowerShellScript \
-          --scripts "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -like '100.*' } | Select-Object -ExpandProperty IPAddress" \
-          --query "value[0].message" -o tsv)
-        echo "ip=$IP" >> $GITHUB_OUTPUT
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-    - name: Generate RDP File
-      run: |
-        cat > windows11-gpu.rdp << EOF
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Generate GPU-Optimized RDP File
+        run: |
+          $rdpContent = @"
 screen mode id:i:2
 use multimon:i:1
 desktopwidth:i:1920
@@ -121,7 +175,7 @@ disable menu anims:i:1
 disable themes:i:0
 disable cursor setting:i:0
 bitmapcachepersistenable:i:1
-full address:s:${{ steps.tailscale_ip.outputs.ip }}
+full address:s:$env:TAILSCALE_IP
 audiomode:i:0
 redirectprinters:i:1
 redirectcomports:i:0
@@ -149,29 +203,64 @@ video compression quality: i:100
 gpu acceleration: i:1
 avc444 mode: i:1
 avc444 mode preferred: i:1
-EOF
+hardware encoder: i:1
+"@
+          
+          $rdpContent | Out-File -FilePath "$env:GITHUB_WORKSPACE\gpu-optimized.rdp" -Encoding ASCII
+          Write-Host "GPU-optimized RDP file created"
 
-    - name: Upload RDP File
-      uses: actions/upload-artifact@v4
-      with:
-        name: windows11-gpu-rdp
-        path: windows11-gpu.rdp
+      - name: Verify RDP Accessibility and GPU Status
+        run: |
+          Write-Host "=== Connection Information ==="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "GPU Available: $env:HAS_NVIDIA_GPU"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "✅ TCP connectivity successful!"
+          
+          # Display final GPU status
+          if (env:HAS_NVIDIA_GPU -eq 'true') {
+              Write-Host "✅ NVIDIA GPU acceleration enabled"
+              # Try to get NVIDIA GPU status
+              try {
+                  $gpuStatus = Get-CimInstance -ClassName Win32_VideoController | Where-Object { $_.Name -like "*NVIDIA*" }
+                  Write-Host "GPU Name: $($gpuStatus.Name)"
+                  Write-Host "GPU RAM: $([math]::Round($gpuStatus.AdapterRAM/1GB, 2)) GB"
+              } catch {
+                  Write-Host "⚠️ Could not retrieve detailed GPU info"
+              }
+          } else {
+              Write-Host "⚠️ Using software rendering - limited GPU acceleration"
+          }
 
-    - name: Output Connection Info
-      run: |
-        echo "Windows 11 RDP with GPU is ready!"
-        echo "Tailscale IP: ${{ steps.tailscale_ip.outputs.ip }}"
-        echo "Username: rdpuser"
-        echo "Download the RDP file from the Artifacts section"
+      - name: Upload GPU-Optimized RDP File
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-rdp-connection
+          path: |
+            ${{ github.workspace }}/gpu-optimized.rdp
+          retention-days: 1
 
-  auto-shutdown:
-    runs-on: ubuntu-latest
-    needs: deploy
-    steps:
-    - name: Configure Auto Shutdown
-      run: |
-        az vm auto-shutdown \
-          --resource-group $RESOURCE_GROUP \
-          --name $VM_NAME \
-          --time 0230 \
-          --email "your-email@example.com"
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS WITH GPU ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS | sed 's/.*Password: //')"
+          Write-Host "GPU Enabled: $env:HAS_NVIDIA_GPU"
+          Write-Host "RDP File: gpu-optimized.rdp (download from Artifacts)"
+          Write-Host "=============================`n"
+          
+          Write-Host "GPU-optimized RDP session is ready!"
+          Write-Host "Use the downloaded RDP file for hardware-accelerated remote desktop."
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - GPU: $env:HAS_NVIDIA_GPU - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
