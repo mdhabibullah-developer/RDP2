@@ -1,0 +1,143 @@
+name: RDP (GPU)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # Target a self-hosted Windows runner which has a GPU and NVIDIA drivers installed.
+    # Make sure your runner is registered with labels: self-hosted, windows, gpu (and x64 if you want)
+    runs-on: [self-hosted, windows, gpu]
+
+    timeout-minutes: 3600
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Verify GPU present (host)
+        shell: powershell
+        run: |
+          Write-Host "=== GPU detection (host) ==="
+          try {
+            nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+          } catch {
+            Write-Host "nvidia-smi not found or no NVIDIA driver; listing display devices:"
+            Get-PnpDevice -Class Display | Format-Table -AutoSize
+            exit 1
+          }
+
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule (allow only over Tailscale if you prefer to lock down later)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || $true
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+              # update password if user exists
+              $u = Get-LocalUser -Name "RDP"
+              $u | Set-LocalUser -Password $securePass
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # wait for IP
+          $tsIP = $null
+          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) -join ','
+              Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP & GPU from host (port test)
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Verify GPU access in a remote session (manual check guidance)
+        shell: powershell
+        run: |
+          Write-Host "IMPORTANT: GPU availability inside an RDP session depends on Windows/GPO and driver configuration."
+          Write-Host "After you RDP into $env:TAILSCALE_IP (user: $env:RDP_USER), run `nvidia-smi` inside the remote session to confirm the GPU is accessible."
+          Write-Host "If your app can't access GPU, you may need to enable 'Use the hardware default graphics adapter for all Remote Desktop Services sessions' via Group Policy on the host."
+          # (We don't modify GPO automatically here because settings differ by Windows version.)
+
+      - name: Show connection info (printed to logs)
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS INFO ==="
+          Write-Host "Address (Tailscale IP): $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "========================"
+
+      - name: Maintain Connection (WARNING: on GitHub-hosted this will hit job timeout; self-hosted runner persists)
+        shell: powershell
+        run: |
+          # On a self-hosted runner this keeps the process alive so you can RDP in.
+          # On GitHub-hosted runners this will be killed at the job timeout — prefer self-hosted for long lived access.
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP ready on $env:TAILSCALE_IP (user: $env:RDP_USER)"
+              Start-Sleep -Seconds 300
+          }
